@@ -1,0 +1,14 @@
+{
+  "policies": [
+    {"id": "plan_month", "anchor": 0, "period_seconds": 30, "allowance": 100, "carry_cap": 40},
+    {"id": "plan_day", "anchor": 0, "period_seconds": 10, "allowance": 15, "carry_cap": 5}
+  ],
+  "requests": [
+    {"id": "r1", "timestamp": 2, "cost": 12, "policy_refs": ["plan_month", "plan_day"]},
+    {"id": "r2", "timestamp": 12, "cost": 10, "policy_refs": ["plan_month", "plan_day"]},
+    {"id": "r3", "timestamp": 25, "cost": 8, "policy_refs": ["plan_day"]},
+    {"id": "r4", "timestamp": 31, "cost": 20, "policy_refs": ["plan_month", "plan_day"]},
+    {"id": "r5", "timestamp": 35, "cost": 25, "policy_refs": ["plan_month", "plan_day"]},
+    {"id": "r6", "timestamp": 95, "cost": 30, "policy_refs": ["plan_month"]}
+  ]
+}

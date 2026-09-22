@@ -19,6 +19,8 @@ from app.models import (
     QueueSimulateResponse,
     ReservationSimulateRequest,
     ReservationSimulateResponse,
+    RolloverSimulateRequest,
+    RolloverSimulateResponse,
     RouteSimulateRequest,
     RouteSimulateResponse,
     SimulateRequest,
@@ -31,6 +33,7 @@ from app.models import (
 from app.planner import plan_initial_balances
 from app.queueing import queue_simulate
 from app.reservation import reservation_simulate
+from app.rollover import rollover_simulate
 from app.routing import route_simulate
 from app.simulation import simulate
 from app.usage import usage_report
@@ -61,6 +64,12 @@ app = FastAPI(
         "判定前移除各策略窗口左端已过期事件，仅当请求引用的全部策略在窗口内累计消耗"
         "加 cost 均不超过 limit 时原子记账，否则不改变任何策略并返回引用顺序上首个超限策略；"
         "响应按原始顺序给出 allowed、窗口边界、剩余额度、拒绝原因与各策略终态占用。"
+        "以及 /rollover-simulate：给定多个带 anchor、period_seconds、每期 allowance 与 "
+        "carry_cap 的周期结转策略，请求按时间顺序引用多条策略；跨期时旧结转额失效，"
+        "上一期未用基础额度结转到新周期且不超过 carry_cap，消费时先扣即将失效的结转额、"
+        "再扣本期基础额度；仅当全部引用策略的两类余额合计都足够时原子扣减，"
+        "否则全部不变并返回首个不足策略；响应按原始输入顺序给出周期编号、"
+        "扣减前后两类余额与拒绝原因，并返回最后请求时刻的各策略终态。"
     ),
     version="1.0.0",
 )
@@ -92,6 +101,7 @@ def root():
         "route_simulate": "/route-simulate",
         "queue_simulate": "/queue-simulate",
         "window_simulate": "/window-simulate",
+        "rollover_simulate": "/rollover-simulate",
     }
 
 
@@ -161,3 +171,12 @@ def queue_simulate_endpoint(payload: QueueSimulateRequest) -> QueueSimulateRespo
 )
 def window_simulate_endpoint(payload: WindowSimulateRequest) -> WindowSimulateResponse:
     return window_simulate(payload)
+
+
+@app.post(
+    "/rollover-simulate",
+    response_model=RolloverSimulateResponse,
+    tags=["rollover"],
+)
+def rollover_simulate_endpoint(payload: RolloverSimulateRequest) -> RolloverSimulateResponse:
+    return rollover_simulate(payload)

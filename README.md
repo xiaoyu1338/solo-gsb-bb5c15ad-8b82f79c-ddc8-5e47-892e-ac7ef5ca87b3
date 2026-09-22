@@ -23,6 +23,8 @@
 
 以及 **半开滑动窗口试算** 接口 `POST /window-simulate`：给定多个带 `window_seconds` 与 `limit` 的滑动窗口策略（额度按 `principal` 归属主体相互隔离），以及按时间排序、携带 `principal` / `cost` / `policy_refs` 的请求序列。判定前先移除每个引用策略在**半开窗口** `(timestamp - window_seconds, timestamp]` **左端已过期**的记账事件，再统计窗口内该主体的累计消耗；仅当请求引用的**全部**策略都满足 `used + cost <= limit` 时才**原子记账**（向每个策略追加同一事件），否则**不改变任何策略**并返回 `policy_refs` 顺序上**首个超限策略**。响应按原始输入顺序给出 `allowed`、各引用策略的窗口边界、记账前后占用与剩余额度、拒绝原因明细，并返回各策略在最后请求时刻的**终态占用**（逐主体的事件数/占用/剩余）。
 
+以及 **周期结转额度试算** 接口 `POST /rollover-simulate`：给定多条周期结转策略，每条定义 `anchor`（周期起点）、`period_seconds`（周期长度）、每期 `allowance`（基础额度）与 `carry_cap`（结转上限）；请求按时间顺序引用多条策略。跨期时旧结转额失效，上一期未用完的基础额度结转到新周期且不超过 `carry_cap`；消费时**先扣即将失效的结转额，再扣本期基础额度**。仅当全部引用策略的两类余额合计都足够时才**原子扣减**，否则全部不变并返回引用顺序上首个不足的策略。响应按原始输入顺序给出周期编号、扣减前后两类余额与拒绝原因，并返回最后请求时刻的各策略终态。
+
 ## 一条命令启动
 
 需要已安装 Docker（含 Compose 插件）。在本目录执行：
@@ -45,6 +47,7 @@ docker compose up --build
 | 路由试算接口 | http://localhost:8000/route-simulate （POST） |
 | 排队试算接口 | http://localhost:8000/queue-simulate （POST） |
 | 滑动窗口试算接口 | http://localhost:8000/window-simulate （POST） |
+| 周期结转试算接口 | http://localhost:8000/rollover-simulate （POST） |
 | Swagger 交互文档 | http://localhost:8000/docs |
 | ReDoc 文档 | http://localhost:8000/redoc |
 
@@ -938,6 +941,154 @@ docker compose up --build
 - r5：beta 是独立主体，`per_second` 上拥有自己的满额度 10，cost 9 放行；
 - 终态观察时刻 t=2：`per_second` 窗口 `(1,2]` 内只剩 beta 的 9（alpha t=1 的事件在左边界过期）；`per_minute` 窗口 `(-58,2]` 内 alpha 两笔共 12。
 
+## 请求格式 `POST /rollover-simulate`
+
+给定多条**周期结转**配额策略与一条按时间顺序引用策略的请求序列。每条策略把时间轴划分为固定长度的周期，每期发放基础额度 `allowance`，上一期未用完的基础额度可结转到下一期（封顶 `carry_cap`），结转额只在新一期内有效。
+
+```json
+{
+  "policies": [
+    {"id": "plan_month", "anchor": 0, "period_seconds": 30, "allowance": 100, "carry_cap": 40},
+    {"id": "plan_day", "anchor": 0, "period_seconds": 10, "allowance": 15, "carry_cap": 5}
+  ],
+  "requests": [
+    {"id": "r1", "timestamp": 2, "cost": 12, "policy_refs": ["plan_month", "plan_day"]},
+    {"id": "r2", "timestamp": 12, "cost": 10, "policy_refs": ["plan_month", "plan_day"]},
+    {"id": "r3", "timestamp": 25, "cost": 8, "policy_refs": ["plan_day"]},
+    {"id": "r4", "timestamp": 31, "cost": 20, "policy_refs": ["plan_month", "plan_day"]},
+    {"id": "r5", "timestamp": 35, "cost": 25, "policy_refs": ["plan_month", "plan_day"]},
+    {"id": "r6", "timestamp": 95, "cost": 30, "policy_refs": ["plan_month"]}
+  ]
+}
+```
+
+### 字段说明
+
+**策略 `policies[]`**
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `id` | 是 | 结转策略唯一标识，非空字符串 |
+| `anchor` | 是 | 周期起点（秒，任意一致的时间原点），必须为有限数值 |
+| `period_seconds` | 是 | 周期长度（秒），必须为正的有限数值 |
+| `allowance` | 是 | 每期基础额度（周期开始时重置），必须为正的有限数值 |
+| `carry_cap` | 是 | 上一期未用基础额度结转到下一期的上限，必须为非负有限数值（0 表示不结转） |
+
+**请求 `requests[]`**
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `id` | 是 | 请求唯一标识 |
+| `timestamp` | 是 | 请求时间（秒，任意一致的时间原点），可乱序输入，服务内部按时间排序 |
+| `cost` | 是 | 消耗量，必须 > 0；从每个引用策略各扣此数量 |
+| `policy_refs` | 是 | 引用的策略 ID 列表（至少 1 个），同一请求内不可重复；按此顺序查找首个不足策略 |
+
+### 周期结转语义
+
+1. **周期划分**：策略的周期 `k` 为**半开区间** `[anchor + k·period_seconds, anchor + (k+1)·period_seconds)`，恰好落在周期边界上的时刻属于**右侧新周期**；各策略的周期相互独立。每个周期持有两类余额：本期基础额度 `base`（周期开始时重置为 `allowance`）与结转余额 `carry`（上一期结转，只在本期有效）。
+2. **初始状态**：在模拟起始时刻（最早请求时间戳）所在的周期，各策略持有满额基础额度、无结转（模拟视野内不存在更早的周期）。
+3. **跨期推进**：请求触及策略时，先把该策略惰性推进到请求所在周期（与 `/simulate` 的连续补充类似，**无论放行与否时间都会推进**）：旧结转额**失效**；跨 1 个周期时 `carry = min(carry_cap, 上期剩余 base)`；跨过 ≥1 个完整未触及周期时，中间各期基础额度未被消耗，`carry = min(carry_cap, allowance)`；随后 `base` 重置为 `allowance`。
+4. **时间顺序**：请求按 `timestamp` 升序处理，同一时刻按输入数组顺序处理；`results` 仍按原始数组顺序返回（含 `index`）。
+5. **原子扣减**：仅当请求引用的**全部**策略都满足 `carry + base >= cost` 时才放行，并对每个引用策略**先扣即将失效的结转额、再扣本期基础额度**；任一策略合计不足即拒绝，**所有策略不扣减**（`after == before`，跨期推进仍然生效），`rejected_by` 取 `policy_refs` 顺序上首个不足的策略。
+6. **拒绝原因**：固定为 `insufficient_balance`；`rejection` 给出该策略的周期编号、`cost`、判定时刻的 `carry` / `base` 与合计 `available`。
+7. **判定视图**：每个引用策略的视图给出周期编号 `period`、周期边界 `period_start` / `period_end`，以及跨期推进之后、扣减前后的两类余额（`carry_before/after`、`base_before/after`）。
+8. **终态**：`policies[]` 以**最后一个请求的时间戳**为观察时刻，把全部策略（含从未被引用的）推进到该时刻，给出周期编号、周期边界、两类余额与合计 `total`。
+
+### 响应示例
+
+```json
+{
+  "allowed_count": 5,
+  "rejected_count": 1,
+  "results": [
+    {
+      "request_id": "r1", "index": 0, "timestamp": 2.0, "cost": 12.0,
+      "allowed": true, "rejected_by": null, "rejection": null,
+      "policies": {
+        "plan_month": {"id": "plan_month", "allowance": 100.0, "carry_cap": 40.0,
+          "period": 0, "period_start": 0.0, "period_end": 30.0,
+          "carry_before": 0.0, "carry_after": 0.0, "base_before": 100.0, "base_after": 88.0},
+        "plan_day": {"id": "plan_day", "allowance": 15.0, "carry_cap": 5.0,
+          "period": 0, "period_start": 0.0, "period_end": 10.0,
+          "carry_before": 0.0, "carry_after": 0.0, "base_before": 15.0, "base_after": 3.0}
+      }
+    },
+    {
+      "request_id": "r2", "index": 1, "timestamp": 12.0, "cost": 10.0,
+      "allowed": true, "rejected_by": null, "rejection": null,
+      "policies": {
+        "plan_month": {"id": "plan_month", "allowance": 100.0, "carry_cap": 40.0,
+          "period": 0, "period_start": 0.0, "period_end": 30.0,
+          "carry_before": 0.0, "carry_after": 0.0, "base_before": 88.0, "base_after": 78.0},
+        "plan_day": {"id": "plan_day", "allowance": 15.0, "carry_cap": 5.0,
+          "period": 1, "period_start": 10.0, "period_end": 20.0,
+          "carry_before": 3.0, "carry_after": 0.0, "base_before": 15.0, "base_after": 8.0}
+      }
+    },
+    {
+      "request_id": "r3", "index": 2, "timestamp": 25.0, "cost": 8.0,
+      "allowed": true, "rejected_by": null, "rejection": null,
+      "policies": {
+        "plan_day": {"id": "plan_day", "allowance": 15.0, "carry_cap": 5.0,
+          "period": 2, "period_start": 20.0, "period_end": 30.0,
+          "carry_before": 5.0, "carry_after": 0.0, "base_before": 15.0, "base_after": 12.0}
+      }
+    },
+    {
+      "request_id": "r4", "index": 3, "timestamp": 31.0, "cost": 20.0,
+      "allowed": true, "rejected_by": null, "rejection": null,
+      "policies": {
+        "plan_month": {"id": "plan_month", "allowance": 100.0, "carry_cap": 40.0,
+          "period": 1, "period_start": 30.0, "period_end": 60.0,
+          "carry_before": 40.0, "carry_after": 20.0, "base_before": 100.0, "base_after": 100.0},
+        "plan_day": {"id": "plan_day", "allowance": 15.0, "carry_cap": 5.0,
+          "period": 3, "period_start": 30.0, "period_end": 40.0,
+          "carry_before": 5.0, "carry_after": 0.0, "base_before": 15.0, "base_after": 0.0}
+      }
+    },
+    {
+      "request_id": "r5", "index": 4, "timestamp": 35.0, "cost": 25.0,
+      "allowed": false, "rejected_by": "plan_day",
+      "rejection": {"policy_id": "plan_day", "reason": "insufficient_balance",
+        "period": 3, "cost": 25.0, "carry": 0.0, "base": 0.0, "available": 0.0},
+      "policies": {
+        "plan_month": {"id": "plan_month", "allowance": 100.0, "carry_cap": 40.0,
+          "period": 1, "period_start": 30.0, "period_end": 60.0,
+          "carry_before": 20.0, "carry_after": 20.0, "base_before": 100.0, "base_after": 100.0},
+        "plan_day": {"id": "plan_day", "allowance": 15.0, "carry_cap": 5.0,
+          "period": 3, "period_start": 30.0, "period_end": 40.0,
+          "carry_before": 0.0, "carry_after": 0.0, "base_before": 0.0, "base_after": 0.0}
+      }
+    },
+    {
+      "request_id": "r6", "index": 5, "timestamp": 95.0, "cost": 30.0,
+      "allowed": true, "rejected_by": null, "rejection": null,
+      "policies": {
+        "plan_month": {"id": "plan_month", "allowance": 100.0, "carry_cap": 40.0,
+          "period": 3, "period_start": 90.0, "period_end": 120.0,
+          "carry_before": 40.0, "carry_after": 10.0, "base_before": 100.0, "base_after": 100.0}
+      }
+    }
+  ],
+  "policies": [
+    {"id": "plan_month", "allowance": 100.0, "carry_cap": 40.0,
+      "period": 3, "period_start": 90.0, "period_end": 120.0,
+      "carry": 10.0, "base": 100.0, "total": 110.0},
+    {"id": "plan_day", "allowance": 15.0, "carry_cap": 5.0,
+      "period": 9, "period_start": 90.0, "period_end": 100.0,
+      "carry": 5.0, "base": 15.0, "total": 20.0}
+  ]
+}
+```
+
+- r1：两策略都在各自周期 0，无结转，全部从本期基础额度扣（`plan_month` 100→88、`plan_day` 15→3）；
+- r2：t=12 时 `plan_day` 进入周期 1，上期未用的 3 全部结转（未超 `carry_cap` 5），cost 10 先扣结转 3→0、再扣本期 15→8；`plan_month` 仍在周期 0，直接扣本期 88→78；
+- r3：`plan_day` 进入周期 2，上期未用 8 但结转封顶 5，先扣结转 5→0、再扣本期 15→12；
+- r4：`plan_month` 进入周期 1，上期未用 78 结转封顶 40，cost 20 全部从结转扣（40→20），本期 100 不动；`plan_day` 进入周期 3，结转 5 扣完后本期 15→0；
+- r5：`plan_day` 两类余额合计 0 < 25 → 原子拒绝，`plan_month` 的结转 20 与本期 100 都保持不变；
+- r6：t=95 时 `plan_month` 从周期 1 跨过完整周期进入周期 3，中间周期未消耗，按满额 100 结转封顶 40，cost 30 全部从结转扣（40→10）；
+- 终态观察时刻 t=95：`plan_month` 在周期 3（结转 10 + 本期 100）；`plan_day` 推进到周期 9，满额 15 结转封顶 5。
+
 ## 校验规则（HTTP 422）
 
 以下非法输入都会被拒绝，错误体统一为 `{"detail": [ {"type", "loc", "msg", ...}, ... ]}`：
@@ -951,9 +1102,10 @@ docker compose up --build
 - **非法候选链**（仅 `/route-simulate`）：`chains` 为空、候选链为空、候选链内桶重复；候选链引用未定义的桶同样报 `unknown_bucket_ref`（`loc` 定位到具体候选链）；
 - **非法 deadline**（仅 `/queue-simulate`）：`deadline` 缺失、非有限数值或早于 `timestamp`；
 - **非法滑动窗口策略/请求**（仅 `/window-simulate`）：`policies[].id` 重复（`duplicate_policy`）；`window_seconds` / `limit` 缺失、非有限数值或 `<= 0`；`policy_refs` 引用未定义策略（`unknown_policy_ref`）、为空或在同一请求内重复；`principal` 缺失或不是非空字符串；请求 ID 重复（`duplicate_request`）；
+- **非法周期结转策略/请求**（仅 `/rollover-simulate`）：`policies[].id` 重复（`duplicate_policy`）；`anchor` 非有限数值；`period_seconds` / `allowance` 缺失、非有限数值或 `<= 0`；`carry_cap` 缺失、非有限数值或 `< 0`；`policy_refs` 引用未定义策略（`unknown_policy_ref`）、为空或在同一请求内重复；请求 ID 重复（`duplicate_request`）；
 - 此外还校验：链为空、链内桶重复、`cost <= 0`、请求 ID 重复（`duplicate_request`，仅 `/simulate` 系接口、`/route-simulate` 与 `/queue-simulate`）、多余字段（`extra="forbid"`）。
 
-以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances`、`/usage-report`、`/fairness-report`、`/reservation-simulate`、`/route-simulate`、`/queue-simulate` 与 `/window-simulate` 同时生效（按各自字段；`/plan-initial-balances`、`/usage-report` 与 `/fairness-report` 复用 `/simulate` 的桶与请求跨字段校验；`/reservation-simulate` 使用独立的容量桶模型；`/route-simulate` 复用 `/simulate` 的桶模型并对每条候选链做引用校验；`/queue-simulate` 复用 `/simulate` 的桶、请求字段与跨字段校验，并在请求上增加 `deadline` 校验；`/window-simulate` 使用独立的滑动窗口策略模型，按主体记账并对 `policy_refs` 做引用校验）。
+以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances`、`/usage-report`、`/fairness-report`、`/reservation-simulate`、`/route-simulate`、`/queue-simulate`、`/window-simulate` 与 `/rollover-simulate` 同时生效（按各自字段；`/plan-initial-balances`、`/usage-report` 与 `/fairness-report` 复用 `/simulate` 的桶与请求跨字段校验；`/reservation-simulate` 使用独立的容量桶模型；`/route-simulate` 复用 `/simulate` 的桶模型并对每条候选链做引用校验；`/queue-simulate` 复用 `/simulate` 的桶、请求字段与跨字段校验，并在请求上增加 `deadline` 校验；`/window-simulate` 使用独立的滑动窗口策略模型，按主体记账并对 `policy_refs` 做引用校验；`/rollover-simulate` 使用独立的周期结转策略模型，对 `policy_refs` 做引用校验）。
 
 ## 本地调用示例
 
@@ -993,6 +1145,10 @@ curl -X POST http://localhost:8000/queue-simulate \
 curl -X POST http://localhost:8000/window-simulate \
   -H 'Content-Type: application/json' \
   -d @examples/window-simulate.json
+
+curl -X POST http://localhost:8000/rollover-simulate \
+  -H 'Content-Type: application/json' \
+  -d @examples/rollover-simulate.json
 ```
 
 ## 不使用 Docker 的本地开发（可选）
@@ -1025,6 +1181,7 @@ pytest -q
 │   ├── routing.py       # 候选链路由试算引擎（多候选链选路 + 原子扣减）
 │   ├── queueing.py      # 严格 FIFO 排队试算引擎（队首等待至可执行时刻或 deadline）
 │   ├── windowing.py     # 半开滑动窗口试算引擎（多策略/多主体链上原子记账）
+│   ├── rollover.py      # 周期结转试算引擎（跨期结转 + 先扣结转的原子扣减）
 │   └── errors.py        # 跨字段校验错误类型
 ├── tests/               # pytest 测试（引擎语义 + HTTP）
 ├── examples/request.json
@@ -1036,6 +1193,7 @@ pytest -q
 ├── examples/route-simulate.json
 ├── examples/queue-simulate.json
 ├── examples/window-simulate.json
+├── examples/rollover-simulate.json
 ├── requirements.txt
 ├── Dockerfile           # 依赖安装在镜像构建阶段完成
 ├── docker-compose.yml   # 单命令启动，映射 8000 端口

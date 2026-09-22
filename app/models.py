@@ -1346,3 +1346,236 @@ class WindowSimulateResponse(BaseModel):
         list[WindowPolicyFinalState],
         Field(description="各策略的终态占用，按 policies 输入顺序"),
     ]
+
+
+class RolloverPolicySpec(BaseModel):
+    """周期结转额度策略。
+
+    anchor: 周期起点（秒，任意一致的时间原点），周期 k 为半开区间
+        [anchor + k·period_seconds, anchor + (k+1)·period_seconds)
+    period_seconds: 周期长度（秒）
+    allowance: 每个周期的基础额度（周期开始时重置）
+    carry_cap: 上一周期未用基础额度结转到本周期的上限（0 表示不结转）
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: Annotated[str, Field(min_length=1, description="结转策略唯一标识")]
+    anchor: Annotated[float, Field(description="周期起点（秒，任意一致的时间原点）")]
+    period_seconds: Annotated[float, Field(description="周期长度（秒），必须为正数")]
+    allowance: Annotated[float, Field(description="每期基础额度，必须为正数")]
+    carry_cap: Annotated[float, Field(description="结转上限，必须为非负数（0 表示不结转）")]
+
+    @field_validator("anchor", mode="before")
+    @classmethod
+    def _validate_anchor(cls, value):
+        if not _is_finite_number(value):
+            raise ValueError("anchor 必须是有限数值")
+        return value
+
+    @field_validator("period_seconds", "allowance", "carry_cap", mode="before")
+    @classmethod
+    def _validate_quota_fields(cls, value, info):
+        if not _is_finite_number(value):
+            raise ValueError(f"{info.field_name} 必须是有限数值")
+        if info.field_name in ("period_seconds", "allowance") and value <= 0:
+            raise ValueError(f"{info.field_name} 必须为正数")
+        if info.field_name == "carry_cap" and value < 0:
+            raise ValueError("carry_cap 必须为非负数")
+        return value
+
+
+class RolloverSimRequest(BaseModel):
+    """单次周期结转试算请求。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: Annotated[str, Field(min_length=1, description="请求唯一标识")]
+    timestamp: Annotated[float, Field(description="请求时间（秒，任意一致的时间原点）")]
+    cost: Annotated[float, Field(gt=0, description="消耗量（对每个引用策略各扣此数量）")]
+    policy_refs: Annotated[
+        list[str], Field(min_length=1, description="引用的结转策略 ID 列表，按顺序判定")
+    ]
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def _validate_timestamp(cls, value):
+        if not _is_finite_number(value):
+            raise ValueError("timestamp 必须是有限数值")
+        return value
+
+    @field_validator("cost", mode="before")
+    @classmethod
+    def _validate_cost(cls, value):
+        if not _is_finite_number(value):
+            raise ValueError("cost 必须是有限数值")
+        if value <= 0:
+            raise ValueError("cost 必须为正数")
+        return value
+
+    @field_validator("policy_refs")
+    @classmethod
+    def _validate_refs_shape(cls, value: list[str]):
+        if not value:
+            raise ValueError("policy_refs 至少需要引用一个结转策略")
+        seen: set[str] = set()
+        for policy_id in value:
+            if not isinstance(policy_id, str) or not policy_id:
+                raise ValueError("policy_refs 中的策略 ID 必须是非空字符串")
+            if policy_id in seen:
+                raise ValueError(f"policy_refs 中存在重复策略引用: {policy_id}")
+            seen.add(policy_id)
+        return value
+
+
+class RolloverSimulateRequest(BaseModel):
+    """POST /rollover-simulate 请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    policies: Annotated[
+        list[RolloverPolicySpec], Field(min_length=1, description="周期结转策略集合")
+    ]
+    requests: Annotated[
+        list[RolloverSimRequest],
+        Field(min_length=1, description="按时间戳试算的请求序列（可乱序输入）"),
+    ]
+
+    @model_validator(mode="after")
+    def _cross_validate(self):
+        errors: list[dict] = []
+
+        # 重复策略 ID
+        seen: set[str] = set()
+        duplicates = False
+        for index, policy in enumerate(self.policies):
+            if policy.id in seen:
+                duplicates = True
+                errors.append(
+                    {
+                        "type": "duplicate_policy",
+                        "loc": ("policies", index, "id"),
+                        "msg": f"重复的结转策略 ID: {policy.id}",
+                        "input": policy.id,
+                    }
+                )
+            seen.add(policy.id)
+
+        if duplicates:
+            # 已存在重复定义，引用校验意义不大，直接返回
+            raise RequestValidationErrors(errors)
+
+        # 引用中未知策略
+        for r_index, request in enumerate(self.requests):
+            for p_index, policy_id in enumerate(request.policy_refs):
+                if policy_id not in seen:
+                    errors.append(
+                        {
+                            "type": "unknown_policy_ref",
+                            "loc": ("requests", r_index, "policy_refs", p_index),
+                            "msg": f"请求 {request.id!r} 引用了未定义的结转策略: {policy_id}",
+                            "input": policy_id,
+                        }
+                    )
+
+        # 重复请求 ID（便于调用方定位模拟结果）
+        seen_req: set[str] = set()
+        for r_index, request in enumerate(self.requests):
+            if request.id in seen_req:
+                errors.append(
+                    {
+                        "type": "duplicate_request",
+                        "loc": ("requests", r_index, "id"),
+                        "msg": f"重复的请求 ID: {request.id}",
+                        "input": request.id,
+                    }
+                )
+            seen_req.add(request.id)
+
+        if errors:
+            raise RequestValidationErrors(errors)
+        return self
+
+
+class RolloverPolicyView(BaseModel):
+    """单个请求对某个引用策略的判定视图（跨期推进之后、扣减前后）。"""
+
+    id: str
+    allowance: Annotated[float, Field(description="该策略的每期基础额度")]
+    carry_cap: Annotated[float, Field(description="该策略的结转上限")]
+    period: Annotated[int, Field(description="请求时刻所在的周期编号")]
+    period_start: Annotated[float, Field(description="本周期起点（含）")]
+    period_end: Annotated[float, Field(description="本周期终点（不含）")]
+    carry_before: Annotated[
+        float, Field(description="跨期推进之后、扣减之前的结转余额（上期结转，期末失效）")
+    ]
+    carry_after: Annotated[
+        float, Field(description="扣减之后的结转余额；被拒绝时与 carry_before 相同")
+    ]
+    base_before: Annotated[
+        float, Field(description="跨期推进之后、扣减之前的本期基础额度余额")
+    ]
+    base_after: Annotated[
+        float, Field(description="扣减之后的本期基础额度余额；被拒绝时与 base_before 相同")
+    ]
+
+
+class RolloverRejection(BaseModel):
+    """拒绝原因：首个两类余额合计不足的引用策略。"""
+
+    policy_id: Annotated[str, Field(description="首个合计不足的策略 ID（按 policy_refs 顺序）")]
+    reason: Annotated[
+        Literal["insufficient_balance"],
+        Field(description="拒绝原因：结转余额与本期基础额度合计不足以覆盖 cost"),
+    ]
+    period: Annotated[int, Field(description="判定时刻该策略所在的周期编号")]
+    cost: Annotated[float, Field(description="本次请求的消耗量")]
+    carry: Annotated[float, Field(description="判定时刻的结转余额")]
+    base: Annotated[float, Field(description="判定时刻的本期基础额度余额")]
+    available: Annotated[float, Field(description="判定时刻两类余额合计 = carry + base")]
+
+
+class RolloverSimResult(BaseModel):
+    """单项请求的周期结转试算结果。"""
+
+    request_id: str
+    index: Annotated[int, Field(description="该请求在原始 requests 数组中的下标")]
+    timestamp: float
+    cost: float
+    allowed: bool
+    policies: Annotated[
+        dict[str, RolloverPolicyView],
+        Field(description="各引用策略的判定视图，按 policy_refs 顺序"),
+    ]
+    rejected_by: Annotated[
+        str | None, Field(default=None, description="首个合计不足的策略 ID；放行时为 null")
+    ] = None
+    rejection: Annotated[
+        RolloverRejection | None, Field(default=None, description="拒绝原因明细；放行时为 null")
+    ] = None
+
+
+class RolloverPolicyFinalState(BaseModel):
+    """单个策略在模拟结束时刻（最后一个请求时间戳）的终态。"""
+
+    id: str
+    allowance: Annotated[float, Field(description="该策略的每期基础额度")]
+    carry_cap: Annotated[float, Field(description="该策略的结转上限")]
+    period: Annotated[int, Field(description="终态时刻所在的周期编号")]
+    period_start: Annotated[float, Field(description="终态周期起点（含）")]
+    period_end: Annotated[float, Field(description="终态周期终点（不含）")]
+    carry: Annotated[float, Field(description="终态结转余额")]
+    base: Annotated[float, Field(description="终态本期基础额度余额")]
+    total: Annotated[float, Field(description="终态两类余额合计 = carry + base")]
+
+
+class RolloverSimulateResponse(BaseModel):
+    allowed_count: int
+    rejected_count: int
+    results: Annotated[
+        list[RolloverSimResult], Field(description="逐项请求结果，按原始输入索引升序")
+    ]
+    policies: Annotated[
+        list[RolloverPolicyFinalState],
+        Field(description="各策略在最后请求时刻的终态，按 policies 输入顺序"),
+    ]
